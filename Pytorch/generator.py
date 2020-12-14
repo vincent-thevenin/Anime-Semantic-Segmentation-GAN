@@ -1,58 +1,73 @@
-#coding: utf-8
-from chainer import Chain
-from chainer.backends import cuda
-from chainer.initializers import HeNormal
-import chainer.functions as F
-import chainer.links as L
+import torch
+import torch.nn as nn
+from torchvision.models import resnet101
 
-from architecture import ASPP, PixelShuffler
-from spectral_norms import define_conv, define_deconv
-from atrous_conv import define_atrous_conv
+from Pytorch.architecture import ASPP, PixelShuffler
+from Pytorch.spectral_norms import define_conv
+from Pytorch.atrous_conv import define_atrous_conv
 
-class ResNetDeepLab(Chain):
+class ResNetDeepLab(nn.Module):
     def __init__(self, opt):
         super().__init__()
 
-        he_w = HeNormal()
-        with self.init_scope():
-            # This ResNet101 use a pre-trained caffemodel that can be downloaded at GitHub
-            # <https://github.com/KaimingHe/deep-residual-networks>.
-            self.resnet101 = L.ResNet101Layers(None)
-            self.use_layer = ('res3', 512)
-            nf = self.use_layer[1]
+        # he_w = HeNormal()
 
-            self.c1 = define_atrous_conv(opt)(nf, nf, ksize=3, rate=2, initialW=he_w)
-            self.norm1 = L.BatchNormalization(nf)
+        # This ResNet101 use a pre-trained caffemodel that can be downloaded at GitHub
+        # <https://github.com/KaimingHe/deep-residual-networks>.
+        self.resnet101 = resnet101(pretrained=False)
+        self.use_layer = ('res3', 512)
+        nf = self.use_layer[1]
 
-            self.c2 = define_atrous_conv(opt)(nf, nf, ksize=3, rate=4, initialW=he_w)
-            self.norm2 = L.BatchNormalization(nf)
+        self.c1 = define_atrous_conv(opt)(nf, nf, ksize=3, rate=2)#, initialW=he_w)
+        self.norm1 = nn.BatchNorm2d(nf)
 
-            self.aspp = ASPP(opt, nf, input_resolution=32)
-            self.up1 = PixelShuffler(opt, nf, nf // 2, rate=2) #32 -> 64
-            self.up2 = PixelShuffler(opt, nf // 2, nf // 4, rate=2) #64 -> 128
-            self.up3 = PixelShuffler(opt, nf // 4, nf // 8, rate=2) # 128 -> 256
-            self.to_class = define_conv(opt)(nf // 8, opt.class_num, ksize=3, pad=1, initialW=he_w)
+        self.c2 = define_atrous_conv(opt)(nf, nf, ksize=3, rate=4)#, initialW=he_w)
+        self.norm2 = nn.BatchNorm2d(nf)
 
-        self.activation = F.leaky_relu
+        self.aspp = ASPP(opt, nf, input_resolution=32)
+        self.up1 = PixelShuffler(opt, nf, nf // 2, rate=2) #32 -> 64
+        self.up2 = PixelShuffler(opt, nf // 2, nf // 4, rate=2) #64 -> 128
+        self.up3 = PixelShuffler(opt, nf // 4, nf // 8, rate=2) # 128 -> 256
+        self.to_class = define_conv(opt)(nf // 8, opt.class_num, ksize=3, pad=1)
+
+        self.activation = nn.LeakyReLU()
+        self.softmax = nn.Softmax(dim=1)
 
     def prepare(self, variable_img):
         #out = F.resize_images(variable_img, (224, 224))
         out = variable_img
         #out = (out + 1) * 0.5
-        out = out[:, ::-1, :, :]
-        out = F.transpose(out, (0, 2, 3, 1))
+        out = out.flip(1)
+
+        out = out.transpose(2,1) #0, 2, 1, 3
+        out = out.transpose(-1,-2) #0, 2, 3, 1
 
         out *= 255
-        xp = cuda.get_array_module(variable_img.array)
-        out -= xp.array([103.063, 115.903, 123.152], dtype=variable_img.dtype)
+        out -= torch.Tensor([103.063, 115.903, 123.152]).type(variable_img.dtype)
 
-        out = F.transpose(out, (0, 3, 1, 2))
+        out = out.transpose(1,2) #0,2,1,3
+        out = out.transpose(1,-1) #0,3,1,2
 
         return out
 
-    def __call__(self, x):
+    def forward(self, x):
         x = self.prepare(x)
-        h = self.resnet101(x, [self.use_layer[0]])[self.use_layer[0]]
+
+        resnet_res3_feature = [] #res3 in chainer is layer2 in pytorch
+        resnet_res3_handle = []
+        def resnetHook(module, input, output):
+            resnet_res3_feature.append(output)
+        
+        #place hook
+        resnet_res3_handle.append(
+            self.resnet101.layer2.register_forward_hook(resnetHook)
+        )
+
+        self.resnet101(x)
+        #retrieve feature
+        resnet_res3_handle[0].remove()
+        h = resnet_res3_feature[0]
+        
         h = self.activation(h)
 
         h = self.c1(h)
@@ -75,11 +90,11 @@ class ResNetDeepLab(Chain):
         h = self.activation(h)
 
         out = self.to_class(h)
-        out = F.softmax(out, axis=1)
+        out = self.softmax(out)
 
         return out
 
-
+"""
 class DilatedFCN(Chain):
     def __init__(self, opt):
         super().__init__()
@@ -257,3 +272,4 @@ class UNet(Chain):
         out = F.softmax(out, axis=1)
 
         return out
+"""
